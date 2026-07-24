@@ -42,26 +42,35 @@ def extract_media(url: str):
 
 @app.get("/proxy")
 async def proxy_download(url: str, filename: str = "video.mp4"):
-    # Forward common browser headers so TikTok CDN accepts the pipe request
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Referer": "https://www.tiktok.com/"
-    }
-    
     client = httpx.AsyncClient(follow_redirects=True, timeout=60.0)
     
+    # First, make a head/get request to fetch metadata from TikTok's CDN
+    try:
+        upstream_response = await client.get(url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "Referer": "https://www.tiktok.com/"
+        }, stream=True)
+    except Exception as e:
+        await client.aclose()
+        raise HTTPException(status_code=502, detail=f"Failed to connect to media source: {str(e)}")
+
+    content_length = upstream_response.headers.get("content-length")
+
     async def stream_generator():
         try:
-            async with client.stream("GET", url, headers=headers) as response:
-                async for chunk in response.aiter_bytes():
-                    yield chunk
+            async for chunk in upstream_response.aiter_bytes():
+                yield chunk
         finally:
+            await upstream_response.aclose()
             await client.aclose()
 
+    # Pass the Content-Length so the browser displays progress and starts immediately
     response_headers = {
         "Content-Disposition": f'attachment; filename="{filename}"',
         "Access-Control-Allow-Origin": "*"
     }
+    if content_length:
+        response_headers["Content-Length"] = content_length
 
     return StreamingResponse(
         stream_generator(), 
