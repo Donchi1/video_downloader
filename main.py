@@ -1,8 +1,7 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import RedirectResponse
 import yt_dlp
-import httpx
 
 app = FastAPI(title="Social Media Downloader API")
 
@@ -42,23 +41,6 @@ def extract_media(url: str):
         raise HTTPException(status_code=400, detail=f"Failed to extract video: {str(e)}")
 
 @app.get("/proxy")
-async def proxy_download(url: str, filename: str = "video.mp4"):
-    client = httpx.AsyncClient(follow_redirects=True)
-    
-    async def stream_generator():
-        try:
-            async with client.stream("GET", url) as response:
-                async for chunk in response.aiter_bytes():
-                    yield chunk
-        finally:
-            await client.aclose()
-
-    headers = {
-        "Content-Disposition": f'attachment; filename="{filename}"'
-    }
-
-    return StreamingResponse(
-        stream_generator(), 
-        media_type="video/mp4", 
-        headers=headers
-    )
+def proxy_download(url: str, filename: str = "video.mp4"):
+    # Instantly redirect the browser to the direct media CDN link
+    return RedirectResponse(url=url, status_code=303)
