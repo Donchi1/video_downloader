@@ -41,6 +41,24 @@ def extract_media(url: str):
         raise HTTPException(status_code=400, detail=f"Failed to extract video: {str(e)}")
 
 @app.get("/proxy")
-def proxy_download(url: str, filename: str = "video.mp4"):
-    # Instantly redirect the browser to the direct media CDN link
-    return RedirectResponse(url=url, status_code=303)
+async def proxy_download(url: str, filename: str = "video.mp4"):
+    client = httpx.AsyncClient(follow_redirects=True, timeout=30.0)
+    
+    async def stream_generator():
+        try:
+            async with client.stream("GET", url) as response:
+                async for chunk in response.aiter_bytes():
+                    yield chunk
+        finally:
+            await client.aclose()
+
+    headers = {
+        "Content-Disposition": f'attachment; filename="{filename}"',
+        "Access-Control-Allow-Origin": "*"
+    }
+
+    return StreamingResponse(
+        stream_generator(), 
+        media_type="application/octet-stream", 
+        headers=headers
+    )
