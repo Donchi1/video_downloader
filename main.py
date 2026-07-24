@@ -82,6 +82,9 @@
     
 
 import os
+import time
+import asyncio
+from typing import Dict, Tuple, Any
 from urllib.parse import urlparse
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -89,9 +92,14 @@ from fastapi.responses import StreamingResponse
 import httpx
 import yt_dlp
 
-app = FastAPI(title="Multi-Platform Social Media Downloader API")
+app = FastAPI(
+    title="Multi-Platform Social Media Downloader API",
+    version="1.0.0",
+    docs_url="/docs",
+    redoc_url=None,
+)
 
-# Setup CORS middleware with exposed headers for forced downloads
+# Enable CORS with explicit exposed headers for cross-origin downloads
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -101,9 +109,17 @@ app.add_middleware(
     expose_headers=["Content-Disposition", "Content-Length"],
 )
 
+# ------------------------------------------------------------------------------
+# IN-MEMORY TTL CACHE CONFIGURATION
+# ------------------------------------------------------------------------------
+# Storage structure: { "original_post_url": (data_dict, timestamp) }
+stream_cache: Dict[str, Tuple[Dict[str, Any], float]] = {}
+CACHE_TTL_SECONDS = 3600  # 1 hour cache window before re-extracting
+cache_lock = asyncio.Lock()
+
 
 def get_platform_headers(url: str) -> dict:
-    """Generates appropriate browser headers and Referers to bypass CDN hotlinking blocks."""
+    """Generates anti-hotlinking headers matched to target domain CDNs."""
     domain = urlparse(url).netloc.lower()
 
     headers = {
@@ -128,75 +144,124 @@ def get_platform_headers(url: str) -> dict:
     return headers
 
 
-@app.get("/")
-def home():
-    return {"status": "API is running successfully!"}
-
-
-@app.get("/extract")
-def extract_media(url: str):
+def run_yt_dlp_extract(url: str) -> dict:
+    """Synchronous worker function to execute yt_dlp in a thread pool."""
     headers = get_platform_headers(url)
 
     ydl_opts = {
-        # Select single-file MP4 streams to avoid requiring server-side ffmpeg merging
+        # Prefers pre-merged MP4 streams to avoid requiring FFmpeg joining
         "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
         "quiet": True,
         "no_warnings": True,
         "http_headers": headers,
     }
 
-    # Pass cookies file to yt_dlp if present in environment/root directory
     if os.path.exists("cookies.txt"):
         ydl_opts["cookiefile"] = "cookies.txt"
 
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+
+        # Handle carousel/playlist posts (IG, TikTok carousels)
+        if "entries" in info and info["entries"]:
+            info = info["entries"][0]
+
+        download_url = info.get("url")
+        if not download_url and info.get("requested_formats"):
+            download_url = info["requested_formats"][0].get("url")
+
+        if not download_url:
+            raise ValueError("No direct video download stream found.")
+
+        return {
+            "title": info.get("title", "Social Media Video"),
+            "thumbnail": info.get("thumbnail"),
+            "platform": info.get("extractor_key"),
+            "duration": info.get("duration"),
+            "downloadUrl": download_url,
+            "ext": info.get("ext", "mp4"),
+        }
+
+
+# ------------------------------------------------------------------------------
+# API ENDPOINTS
+# ------------------------------------------------------------------------------
+
+@app.get("/")
+def health_check():
+    return {"status": "healthy", "service": "Media Extractor API"}
+
+
+@app.get("/extract")
+async def extract_media(url: str):
+    """
+    Extracts video metadata and temporary CDN link on-demand.
+    Caches extraction results for 1 hour to ensure sub-10ms response times on repeat requests.
+    """
+    now = time.time()
+
+    # 1. Check cache hit
+    async with cache_lock:
+        if url in stream_cache:
+            cached_data, timestamp = stream_cache[url]
+            if now - timestamp < CACHE_TTL_SECONDS:
+                return {**cached_data, "cached": True}
+            else:
+                del stream_cache[url]  # Evict expired entry
+
+    # 2. Extract fresh stream link off main async loop
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-
-            # Handle playlists or multi-item posts (e.g. IG Carousels)
-            if "entries" in info and info["entries"]:
-                info = info["entries"][0]
-
-            download_url = info.get("url")
-            if not download_url and info.get("requested_formats"):
-                download_url = info["requested_formats"][0].get("url")
-
-            if not download_url:
-                raise HTTPException(
-                    status_code=404, detail="Could not find a direct download stream URL."
-                )
-
-            return {
-                "title": info.get("title", "Social Media Video"),
-                "thumbnail": info.get("thumbnail"),
-                "platform": info.get("extractor_key"),
-                "duration": info.get("duration"),
-                "downloadUrl": download_url,
-                "ext": info.get("ext", "mp4"),
-            }
+        extracted_data = await asyncio.to_thread(run_yt_dlp_extract, url)
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to extract video: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Extraction failed: {str(e)}")
+
+    # 3. Store result in cache
+    async with cache_lock:
+        stream_cache[url] = (extracted_data, now)
+
+    return {**extracted_data, "cached": False}
 
 
 @app.get("/proxy")
 async def proxy_download(url: str, filename: str = "video.mp4"):
+    """
+    Proxies video streams directly from source CDNs.
+    Attaches Content-Disposition headers to force browser downloads.
+    """
     headers = get_platform_headers(url)
 
-    async def video_stream_generator():
-        # Open stream connection using client.stream context manager
-        async with httpx.AsyncClient(follow_redirects=True, timeout=60.0) as client:
-            async with client.stream("GET", url, headers=headers) as upstream_response:
-                if upstream_response.status_code >= 400:
-                    raise HTTPException(
-                        status_code=upstream_response.status_code,
-                        detail=f"CDN connection failed with status code {upstream_response.status_code}",
-                    )
+    async with httpx.AsyncClient(follow_redirects=True, timeout=60.0) as client:
+        try:
+            # Send HEAD/GET initialization request to read headers before streaming
+            upstream_response = await client.get(url, headers=headers, stream=True)
+            if upstream_response.status_code >= 400:
+                raise HTTPException(
+                    status_code=upstream_response.status_code,
+                    detail="CDN connection rejected by provider.",
+                )
+        except Exception as e:
+            raise HTTPException(
+                status_code=502, detail=f"Failed connecting to upstream CDN: {str(e)}"
+            )
 
-                async for chunk in upstream_response.aiter_bytes():
+        content_length = upstream_response.headers.get("content-length")
+        content_type = upstream_response.headers.get("content-type", "video/mp4")
+
+        async def stream_generator():
+            try:
+                async for chunk in upstream_response.aiter_bytes(chunk_size=65536):
                     yield chunk
+            finally:
+                await upstream_response.aclose()
 
-    return StreamingResponse(
-        video_stream_generator(),
-        media_type="video/mp4",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
-    )
+        response_headers = {
+            "Content-Disposition": f'attachment; filename="{filename}"',
+        }
+        if content_length:
+            response_headers["Content-Length"] = content_length
+
+        return StreamingResponse(
+            stream_generator(),
+            media_type=content_type,
+            headers=response_headers,
+        )
