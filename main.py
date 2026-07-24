@@ -230,38 +230,23 @@ async def proxy_download(url: str, filename: str = "video.mp4"):
     """
     headers = get_platform_headers(url)
 
-    async with httpx.AsyncClient(follow_redirects=True, timeout=60.0) as client:
-        try:
-            # Send HEAD/GET initialization request to read headers before streaming
-            upstream_response = await client.get(url, headers=headers, stream=True)
-            if upstream_response.status_code >= 400:
-                raise HTTPException(
-                    status_code=upstream_response.status_code,
-                    detail="CDN connection rejected by provider.",
-                )
-        except Exception as e:
-            raise HTTPException(
-                status_code=502, detail=f"Failed connecting to upstream CDN: {str(e)}"
-            )
-
-        content_length = upstream_response.headers.get("content-length")
-        content_type = upstream_response.headers.get("content-type", "video/mp4")
-
-        async def stream_generator():
-            try:
+    async def video_stream_generator():
+        # Correct HTTPX streaming method using client.stream() context manager
+        async with httpx.AsyncClient(follow_redirects=True, timeout=60.0) as client:
+            async with client.stream("GET", url, headers=headers) as upstream_response:
+                if upstream_response.status_code >= 400:
+                    raise HTTPException(
+                        status_code=upstream_response.status_code,
+                        detail=f"CDN connection rejected with status code {upstream_response.status_code}"
+                    )
+                
                 async for chunk in upstream_response.aiter_bytes(chunk_size=65536):
                     yield chunk
-            finally:
-                await upstream_response.aclose()
 
-        response_headers = {
-            "Content-Disposition": f'attachment; filename="{filename}"',
+    return StreamingResponse(
+        video_stream_generator(),
+        media_type="video/mp4",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"'
         }
-        if content_length:
-            response_headers["Content-Length"] = content_length
-
-        return StreamingResponse(
-            stream_generator(),
-            media_type=content_type,
-            headers=response_headers,
-        )
+    )
