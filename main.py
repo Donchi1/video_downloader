@@ -53,4 +53,13 @@ async def proxy_download(url: str):
         finally:
             await client.aclose()
 
-    return StreamingResponse(stream_generator(), media_type="video/mp4")
+    # Add headers to force file download instead of inline browser playback
+    headers = {
+        "Content-Disposition": 'attachment; filename="downloaded_video.mp4"'
+    }
+
+    return StreamingResponse(
+        stream_generator(), 
+        media_type="video/mp4", 
+        headers=headers
+    )
