@@ -42,7 +42,7 @@ def extract_media(url: str):
         raise HTTPException(status_code=400, detail=f"Failed to extract video: {str(e)}")
 
 @app.get("/proxy")
-async def proxy_download(url: str):
+async def proxy_download(url: str, filename: str = "video.mp4"):
     client = httpx.AsyncClient(follow_redirects=True)
     
     async def stream_generator():
@@ -53,9 +53,8 @@ async def proxy_download(url: str):
         finally:
             await client.aclose()
 
-    # Add headers to force file download instead of inline browser playback
     headers = {
-        "Content-Disposition": 'attachment; filename="downloaded_video.mp4"'
+        "Content-Disposition": f'attachment; filename="{filename}"'
     }
 
     return StreamingResponse(
