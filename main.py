@@ -42,23 +42,29 @@ def extract_media(url: str):
 
 @app.get("/proxy")
 async def proxy_download(url: str, filename: str = "video.mp4"):
-    client = httpx.AsyncClient(follow_redirects=True, timeout=30.0)
+    # Forward common browser headers so TikTok CDN accepts the pipe request
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Referer": "https://www.tiktok.com/"
+    }
+    
+    client = httpx.AsyncClient(follow_redirects=True, timeout=60.0)
     
     async def stream_generator():
         try:
-            async with client.stream("GET", url) as response:
+            async with client.stream("GET", url, headers=headers) as response:
                 async for chunk in response.aiter_bytes():
                     yield chunk
         finally:
             await client.aclose()
 
-    headers = {
+    response_headers = {
         "Content-Disposition": f'attachment; filename="{filename}"',
         "Access-Control-Allow-Origin": "*"
     }
 
     return StreamingResponse(
         stream_generator(), 
-        media_type="application/octet-stream", 
-        headers=headers
+        media_type="video/mp4", 
+        headers=response_headers
     )
