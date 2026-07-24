@@ -79,8 +79,6 @@
 #     )
 
 
-    
-
 import os
 import time
 import asyncio
@@ -112,9 +110,8 @@ app.add_middleware(
 # ------------------------------------------------------------------------------
 # IN-MEMORY TTL CACHE CONFIGURATION
 # ------------------------------------------------------------------------------
-# Storage structure: { "original_post_url": (data_dict, timestamp) }
 stream_cache: Dict[str, Tuple[Dict[str, Any], float]] = {}
-CACHE_TTL_SECONDS = 3600  # 1 hour cache window before re-extracting
+CACHE_TTL_SECONDS = 3600  # 1 hour cache window
 cache_lock = asyncio.Lock()
 
 
@@ -149,7 +146,6 @@ def run_yt_dlp_extract(url: str) -> dict:
     headers = get_platform_headers(url)
 
     ydl_opts = {
-        # Prefers pre-merged MP4 streams to avoid requiring FFmpeg joining
         "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
         "quiet": True,
         "no_warnings": True,
@@ -162,7 +158,6 @@ def run_yt_dlp_extract(url: str) -> dict:
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
 
-        # Handle carousel/playlist posts (IG, TikTok carousels)
         if "entries" in info and info["entries"]:
             info = info["entries"][0]
 
@@ -196,7 +191,7 @@ def health_check():
 async def extract_media(url: str):
     """
     Extracts video metadata and temporary CDN link on-demand.
-    Caches extraction results for 1 hour to ensure sub-10ms response times on repeat requests.
+    Caches extraction results for 1 hour.
     """
     now = time.time()
 
@@ -207,7 +202,7 @@ async def extract_media(url: str):
             if now - timestamp < CACHE_TTL_SECONDS:
                 return {**cached_data, "cached": True}
             else:
-                del stream_cache[url]  # Evict expired entry
+                del stream_cache[url]
 
     # 2. Extract fresh stream link off main async loop
     try:
@@ -226,27 +221,51 @@ async def extract_media(url: str):
 async def proxy_download(url: str, filename: str = "video.mp4"):
     """
     Proxies video streams directly from source CDNs.
-    Attaches Content-Disposition headers to force browser downloads.
     """
     headers = get_platform_headers(url)
 
+    client = httpx.AsyncClient(follow_redirects=True, timeout=60.0)
+
+    try:
+        # Step 1: Open stream connection BEFORE sending StreamingResponse
+        req = client.build_request("GET", url, headers=headers)
+        upstream_response = await client.send(req, stream=True)
+
+        if upstream_response.status_code >= 400:
+            await upstream_response.aclose()
+            await client.aclose()
+            raise HTTPException(
+                status_code=upstream_response.status_code,
+                detail=f"CDN server returned status {upstream_response.status_code}"
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        await client.aclose()
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to connect to CDN: {str(e)}"
+        )
+
+    # Step 2: Extract Content-Length header if provided by CDN
+    content_length = upstream_response.headers.get("content-length")
+
     async def video_stream_generator():
-        # Correct HTTPX streaming method using client.stream() context manager
-        async with httpx.AsyncClient(follow_redirects=True, timeout=60.0) as client:
-            async with client.stream("GET", url, headers=headers) as upstream_response:
-                if upstream_response.status_code >= 400:
-                    raise HTTPException(
-                        status_code=upstream_response.status_code,
-                        detail=f"CDN connection rejected with status code {upstream_response.status_code}"
-                    )
-                
-                async for chunk in upstream_response.aiter_bytes(chunk_size=65536):
-                    yield chunk
+        try:
+            async for chunk in upstream_response.aiter_bytes(chunk_size=65536):
+                yield chunk
+        finally:
+            await upstream_response.aclose()
+            await client.aclose()
+
+    response_headers = {
+        "Content-Disposition": f'attachment; filename="{filename}"'
+    }
+    if content_length:
+        response_headers["Content-Length"] = content_length
 
     return StreamingResponse(
         video_stream_generator(),
         media_type="video/mp4",
-        headers={
-            "Content-Disposition": f'attachment; filename="{filename}"'
-        }
+        headers=response_headers,
     )
